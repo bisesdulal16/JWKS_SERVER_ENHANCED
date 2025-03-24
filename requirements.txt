@@ -1,0 +1,6 @@
+Flask==3.0.2
+cryptography==42.0.5
+PyJWT==2.8.0
+pytest==8.0.0
+pytest-cov==4.1.0
+requests==2.31.0  # Needed for testing API requests
