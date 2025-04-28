@@ -167,7 +167,7 @@ JWKS_SERVER_ENHANCED/
 
 ## **📄 Technologies Used**
 - **Flask** - RESTful API framework  
-- **argon2-cffi - Password hashing security
+- **argon2-cffi** - Password hashing security
 - **PyJWT** - JWT creation  
 - **cryptography** - RSA keys  
 - **SQLite** - Lightweight DB storage  
