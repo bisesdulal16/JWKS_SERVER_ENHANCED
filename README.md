@@ -1,22 +1,23 @@
-# **Flask JWKS Server**
+# **Extended JWKS Server**
 
-## **Description**
-A lightweight **JWKS (JSON Web Key Set) server** built using **Flask**, extended with:
-- ✅ **SQLite-backed RSA key storage**
-- ✅ **Automatic key expiration and cleanup**
-- ✅ **Authentication via JWTs**
-- ✅ **Test suite with 94%+ coverage**
+## **📖 Description**
+A secure, lightweight **JWKS (JSON Web Key Set) server** built using **Flask**, with enhanced features:
+- ✅ **AES-encrypted RSA private key storage**
+- ✅ **JWT authentication system**
+- ✅ **Argon2-secured user registration**
+- ✅ **SQLite persistent backend**
+- ✅ **Manual rate limiting and secure query practices**
+- ✅ **Test suite with 94%+ code coverage**
 
 ---
 
 ## **📌 Features**
-✅ **Database Integration:** Stores RSA private keys in `SQLite`.  
-✅ **JWT Signing:** Issues tokens signed with RSA keys using `RS256`.  
-✅ **JWKS Endpoint:** Public key exposure at `/.well-known/jwks.json`.  
-✅ **Expired Tokens:** Generate expired tokens via `?expired=true`.  
-✅ **Cleanup:** Removes expired keys from storage.  
-✅ **Secure Queries:** Uses parameterized queries to prevent SQL injection.  
-✅ **Tested:** Pytest suite with ⭐️ 94%+ code coverage.  
+✅ **Database Integration:** Stores encrypted RSA private keys in `SQLite`.  
+✅ **JWT Signing:** Issues tokens signed with private RSA keys (RS256 algorithm).  
+✅ **JWKS Endpoint:** Public key exposure via `/.well-known/jwks.json`.  
+✅ **Expired Tokens:** Support for issuing expired tokens (`?expired=true`).  
+✅ **Security:** Argon2 password hashing, secure SQL queries, AES encryption.  
+✅ **Tested:** Pytest suite with ⭐ 94%+ code coverage, rate-limiting tests included.
 
 ---
 
@@ -24,8 +25,8 @@ A lightweight **JWKS (JSON Web Key Set) server** built using **Flask**, extended
 
 ### **1️⃣ Clone the Repository**
 ```bash
-git clone https://github.com/yourusername/Extended-JWKS-Server.git
-cd Extended-JWKS-Server
+git clone https://github.com/bisesdulal16/JWKS_SERVER_ENHANCED.git
+cd JWKS_SERVER_ENHANCED
 ```
 
 ### **2️⃣ Create Virtual Environment**
@@ -39,8 +40,13 @@ venv\Scripts\activate      # Windows
 ```bash
 pip install -r requirements.txt
 ```
+### **4️⃣ Set Environment Variable (Important!)**
+```bash
+export NOT_MY_KEY="thisisaverysecurekey1234"   # Must be 16, 24, or 32 bytes
+```
 
-### **4️⃣ Run the Server**
+
+### **5️⃣  Run the Server**
 ```bash
 python app.py
 ```
@@ -60,7 +66,7 @@ curl -X GET http://127.0.0.1:8080/.well-known/jwks.json
 {
   "keys": [
     {
-      "kid": "some-uuid",
+      "kid": "1",
       "kty": "RSA",
       "alg": "RS256",
       "use": "sig",
@@ -73,42 +79,38 @@ curl -X GET http://127.0.0.1:8080/.well-known/jwks.json
 
 ---
 
-### **2. Generate JWT Token**
-**POST** `/auth`
+### **2. Register New User**
+**POST** `/register`
 ```bash
-curl -X POST http://127.0.0.1:8080/auth
+curl -X POST http://127.0.0.1:8080/register -H "Content-Type: application/json" -d '{"username": "newuser", "email": "newuser@example.com"}'
 ```
 **Response:**
 ```json
 {
-  "token": "eyJhbGciOi..."
+  "password": "generated-secure-password"
 }
 ```
 
-### **3. Generate Expired JWT**
-**POST** `/auth?expired=true`
+### **3. Authenticate User (Get JWT)**
+**POST** `/auth`
 ```bash
-curl -X POST http://127.0.0.1:8080/auth?expired=true
+curl -X POST http://127.0.0.1:8080/auth -H "Content-Type: application/json" -d '{"username": "newuser", "password": "generated-secure-password"}'
 ```
 **Response:** (Expired Token)
 ```json
 {
-  "token": "eyJhbGciOi..."
+  "token": "eyJhbGciOiJSUzI1NiIsInR5cCI..."
 }
 ```
 
 ---
 
-### **4. Invalid Method Handling**
-Unsupported HTTP methods return:
-```json
-{
-  "error": "Method Not Allowed"
-}
+### **4. Authenticate for Expired JWT**
+**POST** `/auth?expired=true`
+```bash
+curl -X POST http://127.0.0.1:8080/auth?expired=true -H "Content-Type: application/json" -d '{"username": "newuser", "password": "generated-secure-password"}'
 ```
-Applies to:
-- PUT, DELETE, PATCH on `/auth` & `/.well-known/jwks.json`
-- GET, HEAD on `/auth`
+(Token will be already expired.)
 
 ---
 
@@ -116,24 +118,24 @@ Applies to:
 
 ### **With Coverage Report**
 ```bash
-pytest --cov=app --cov-report=term test/
+pytest --cov=app --cov-report=term-missing test/
 ```
 
 ### ✅ Expected Output:
 ```
 =========================== test session starts ===========================
-collected 7 items
+collected 11 items
 
-test/test_app.py .......
+test/test_app.py ..........
 
----------- coverage: platform darwin, python 3.13.2 ----------
+---------- coverage: platform darwin, python 3.13.3 ----------
 Name     Stmts   Miss  Cover
 ----------------------------
-app.py      72      4    94%
+app.py     220     13    94%
 ----------------------------
-TOTAL       72      4    94%
+TOTAL      220     13    94%
 
-========================= 7 passed in 1.09s ============================
+========================= 11 passed in 1.02s ============================
 ```
 
 ---
@@ -150,20 +152,22 @@ TOTAL       72      4    94%
 
 ## **📂 Project Structure**
 ```
-Extended-JWKS-Server/
-├── app.py                 # Main Flask app with JWKS logic
+JWKS_SERVER_ENHANCED/
+├── app.py                      # Main Flask server logic
+├── crypto_utils.py              # AES Encryption/Decryption helpers
 ├── test/
-│   └── test_app.py        # Unit test suite
-├── totally_not_my_privateKeys.db  # SQLite DB for keys
-├── requirements.txt       # Dependencies
-├── screenshots/           # Output images for grading
-└── venv/                  # Virtual environment (optional)
+│   └── test_app.py              # Test suite
+├── totally_not_my_privateKeys.db  # SQLite database (autogenerated)
+├── requirements.txt             # Project dependencies
+├── README.md                    # Project documentation
+└── venv/                        # Virtual environment (optional)
 ```
 
 ---
 
 ## **📄 Technologies Used**
 - **Flask** - RESTful API framework  
+- **argon2-cffi - Password hashing security
 - **PyJWT** - JWT creation  
 - **cryptography** - RSA keys  
 - **SQLite** - Lightweight DB storage  
