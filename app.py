@@ -1,215 +1,245 @@
 """
-JWKS Server
+JWKS Server with Enhanced Security
 Author: Bishesh Dulal
-Date: March 2025
+Date: April 2025
 
 Description:
-This Flask-based JWKS server provides the following:
-- RSA key pair generation
-- JWT signing using stored keys
-- JWKS endpoint serving public keys
-- Auth endpoint issuing JWTs
-- Handling expired JWT signing
-- SQLite-based persistent key storage
-- Secure parameterized SQL to prevent injection attacks
-
-Endpoints:
-- POST /auth                → Issues a JWT (valid or expired based on query param)
-- GET /.well-known/jwks.json → Returns public keys in JWKS format
+This server implements:
+- RSA key generation with AES-encrypted private key storage
+- Secure user registration with Argon2 password hashing
+- JWT issuance (valid or expired) with RS256 algorithm
+- Public key publication via JWKS endpoint
+- Manual rate limiting
+- SQLite persistent storage
+- Parameterized SQL queries to prevent SQLi attacks
 """
 
+import os
+import time
+import uuid
+import base64
+import sqlite3
+import jwt
 
 from flask import Flask, request, jsonify
+from threading import Lock
+from collections import deque
 from datetime import datetime, timedelta, UTC
+from crypto_utils import encrypt, decrypt
+from argon2 import PasswordHasher
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
-import jwt
-import base64
-import sqlite3
-from pathlib import Path
-import os
+from jwt import encode as jwt_encode
 
-# Initialize Flask application
+# --- Configuration ---
 app = Flask(__name__)
+DB_PATH = "totally_not_my_privateKeys.db"
+MAX_REQUESTS_PER_SECOND = 10
+RATE_LIMIT_WINDOW = 1  # seconds
 
-# Ensure we remove any old incompatible DB
-db_path = Path("totally_not_my_privateKeys.db")
-if db_path.exists():
-    os.remove(db_path) # Start fresh each time (for grading consistency)
+# --- Security Components ---
+ph = PasswordHasher()
+rate_lock = Lock()
+request_timestamps = deque()
 
-# Create the keys table with INTEGER primary key
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS keys (
-        kid INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT NOT NULL,
-        exp INTEGER NOT NULL
-    )
-''')
-conn.commit()
-conn.close()
+# --- Database Initialization ---
+def init_db():
+    """Initialize database schema for keys, users, and auth logs."""
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS keys (
+                kid INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL,
+                exp INTEGER NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                email TEXT UNIQUE,
+                date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auth_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_ip TEXT NOT NULL,
+                request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER REFERENCES users(id)
+            )
+        ''')
+        conn.commit()
 
-# --- Utility Functions ---
-def base64url_encode(value: int) -> str:
-    """
-    Encodes an integer using base64 URL-safe encoding without padding.
-    Used to convert RSA modulus and exponent to JWKS format.
-    """
-    bytes_value = value.to_bytes((value.bit_length() + 7) // 8, 'big')
-    return base64.urlsafe_b64encode(bytes_value).rstrip(b'=').decode('utf-8')
+init_db()
 
+# --- Helper Functions ---
 def generate_key(expired: bool = False) -> int:
-    """
-    Generates an RSA key pair and saves it to the SQLite database.
-
-    Parameters:
-        expired (bool): Whether to generate an expired key
-
-    Returns:
-        int: The auto-incremented Key ID (kid) from the database
-    """
+    """Generate RSA key, encrypt it, and store it with an expiration timestamp."""
     private_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
         backend=default_backend()
     )
-
-    expiry = datetime.now(UTC) + timedelta(hours=1)
-    if expired:
-        expiry = datetime.now(UTC) - timedelta(minutes=5)
-
+    expiry = datetime.now(UTC) - timedelta(minutes=5) if expired else datetime.now(UTC) + timedelta(hours=1)
     pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
-    ).decode('utf-8')
+    ).decode()
 
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('INSERT INTO keys (key, exp) VALUES (?, ?)', (pem, int(expiry.timestamp())))
-    kid = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return kid
+    ciphertext, iv = encrypt(pem)
+    encrypted_value = f"{ciphertext}::{iv}"
 
-def get_key(expired: bool = False):
-    """
-    Fetches one valid or expired key from the database.
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO keys (key, exp) VALUES (?, ?)', (encrypted_value, int(expiry.timestamp())))
+        return cursor.lastrowid
 
-    Parameters:
-        expired (bool): Whether to fetch expired or unexpired key
-
-    Returns:
-        tuple: (kid, private_key PEM string)
-    """
+def get_valid_key(expired: bool = False):
+    """Fetch and decrypt a valid or expired key."""
     now = int(datetime.now(UTC).timestamp())
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    if expired:
-        cursor.execute('SELECT kid, key FROM keys WHERE exp < ? LIMIT 1', (now,))
-    else:
-        cursor.execute('SELECT kid, key FROM keys WHERE exp > ? LIMIT 1', (now,))
-    result = cursor.fetchone()
-    conn.close()
-    return result
+    query = 'SELECT kid, key FROM keys WHERE exp {} ? LIMIT 1'.format('<' if expired else '>')
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        cursor.execute(query, (now,))
+        result = cursor.fetchone()
 
-def get_all_valid_keys():
-    """
-    Retrieves all unexpired keys from the database.
+    if result:
+        kid, encrypted_data = result
+        ciphertext, iv = encrypted_data.split("::")
+        return kid, decrypt(ciphertext, iv)
+    return None
 
-    Returns:
-        list of tuples: [(kid, key PEM), ...]
-    """
-    now = int(datetime.now(UTC).timestamp())
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('SELECT kid, key FROM keys WHERE exp > ?', (now,))
-    keys = cursor.fetchall()
-    conn.close()
-    return keys
+# --- Middleware ---
+@app.before_request
+def apply_rate_limit():
+    """Enforce manual rate limiting on /auth POST requests."""
+    if request.path == '/auth' and request.method == 'POST':
+        with rate_lock:
+            now = time.time()
+            while request_timestamps and request_timestamps[0] < now - RATE_LIMIT_WINDOW:
+                request_timestamps.popleft()
+            if len(request_timestamps) >= MAX_REQUESTS_PER_SECOND:
+                app.logger.warning(f"Rate limit exceeded from {request.remote_addr}")
+                return jsonify(error="Too many requests"), 429
+            request_timestamps.append(now)
 
-@app.route('/.well-known/jwks.json', methods=['GET'])
-def jwks_endpoint():
-    """
-    Returns JWKS (JSON Web Key Set) of active keys.
+# --- Endpoints ---
+@app.route('/register', methods=['POST'])
+def register():
+    """Register a new user and return generated password."""
+    data = request.get_json()
+    if not data or 'username' not in data or 'email' not in data:
+        return jsonify(error="Username and email required"), 400
 
-    Output:
-        JSON list of public keys in JWKS format
-    """
-    keys = get_all_valid_keys()
-    valid_keys = []
-
-    for kid, pem in keys:
-        private_key = serialization.load_pem_private_key(pem.encode('utf-8'), password=None, backend=default_backend())
-        public_key = private_key.public_key()
-        numbers = public_key.public_numbers()
-        valid_keys.append({
-            "kty": "RSA",
-            "use": "sig",
-            "kid": str(kid),  # Must be string in JWKS
-            "n": base64url_encode(numbers.n),
-            "e": base64url_encode(numbers.e),
-            "alg": "RS256"
-        })
-
-    return jsonify(keys=valid_keys), 200, {'Content-Type': 'application/json'}
-
-@app.route('/auth', methods=['POST'])
-def auth_endpoint():
-    """
-    Issues a JWT signed by one of the RSA private keys.
-
-    Query Params:
-        expired=true → Uses an expired key
-
-    Returns:
-        JSON response containing the JWT
-    """
-    expired = 'expired' in request.args
-    result = get_key(expired)
-
-    if not result:
-        generate_key(expired)
-        result = get_key(expired)
-
-    kid, private_pem = result
-
-    exp_time = datetime.now(UTC) + timedelta(minutes=5)
-    if expired:
-        exp_time = datetime.now(UTC) - timedelta(minutes=5)
-
-    payload = {
-        'sub': 'example_user',
-        'iat': datetime.now(UTC),
-        'exp': exp_time
-    }
+    password = str(uuid.uuid4())
+    password_hash = ph.hash(password)
 
     try:
-        token = jwt.encode(
-            payload,
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)',
+                (data['username'], password_hash, data['email'])
+            )
+    except sqlite3.IntegrityError:
+        return jsonify(error="Username/email already exists"), 409
+
+    return jsonify(password=password), 201
+
+@app.route('/auth', methods=['POST'])
+def authenticate():
+    """Authenticate a user and issue a JWT."""
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data or 'password' not in data:
+            return jsonify(error="Missing credentials"), 400
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, password_hash FROM users WHERE username = ?', (data['username'],))
+            user = cursor.fetchone()
+
+        if not user:
+            return jsonify(error="Invalid credentials"), 401
+
+        user_id, stored_hash = user
+        try:
+            ph.verify(stored_hash, data['password'])
+        except Exception:
+            return jsonify(error="Invalid credentials"), 401
+
+        expired = 'expired' in request.args
+        key_data = get_valid_key(expired)
+        if not key_data:
+            generate_key(expired)
+            key_data = get_valid_key(expired)
+            if not key_data:
+                raise ValueError("Key generation failed")
+
+        kid, private_pem = key_data
+        exp_time = datetime.now(UTC) + (timedelta(minutes=-5) if expired else timedelta(minutes=5))
+
+        token = jwt_encode(
+            {'sub': data['username'], 'iat': datetime.now(UTC), 'exp': exp_time},
             private_pem,
             algorithm='RS256',
-            headers={'kid': str(kid)}  # Ensure string header
+            headers={'kid': str(kid)}
         )
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)', (request.remote_addr, user_id))
+
+        return jsonify(token=token)
+
     except Exception as e:
-        return jsonify(error=f"JWT encoding error: {str(e)}"), 500
+        app.logger.error(f"Authentication error: {str(e)}")
+        return jsonify(error="Internal server error"), 500
 
-    return jsonify(token=token), 201
+@app.route('/.well-known/jwks.json', methods=['GET'])
+def jwks():
+    """Return all active public keys in JWKS format."""
+    keys = []
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        cursor.execute('SELECT kid, key FROM keys WHERE exp > ?', (int(datetime.now(UTC).timestamp()),))
+        for kid, encrypted_data in cursor.fetchall():
+            ciphertext, iv = encrypted_data.split("::")
+            pem = decrypt(ciphertext, iv)
+            private_key = serialization.load_pem_private_key(pem.encode(), None, default_backend())
+            public_numbers = private_key.public_key().public_numbers()
 
-@app.route('/.well-known/jwks.json', methods=['PUT', 'POST', 'DELETE', 'PATCH'])
-def jwks_invalid_methods():
-    """Rejects non-GET methods on JWKS endpoint"""
-    return jsonify(error="Method Not Allowed"), 405
+            keys.append({
+                "kty": "RSA",
+                "use": "sig",
+                "kid": str(kid),
+                "n": base64.urlsafe_b64encode(
+                    public_numbers.n.to_bytes((public_numbers.n.bit_length() + 7) // 8, 'big')
+                ).decode().rstrip("="),
+                "e": base64.urlsafe_b64encode(
+                    public_numbers.e.to_bytes((public_numbers.e.bit_length() + 7) // 8, 'big')
+                ).decode().rstrip("="),
+                "alg": "RS256"
+            })
 
-@app.route('/auth', methods=['GET', 'PUT', 'DELETE', 'PATCH', 'HEAD'])
-def auth_invalid_methods():
-    """Rejects non-POST methods on /auth endpoint"""
-    return jsonify(error="Method Not Allowed"), 405
+    return jsonify(keys=keys)
 
 # --- Main ---
 if __name__ == '__main__':
-    generate_key(False) # Valid key
-    generate_key(True) # Expired key
+    generate_key(False)  # Generate valid key
+    generate_key(True)   # Generate expired key
     app.run(host='0.0.0.0', port=8080, debug=False)
